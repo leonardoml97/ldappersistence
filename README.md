@@ -10,7 +10,7 @@ Python tool to execute several Active Directory persistence techniques through L
 - Add Server (Un)Trust Account
 - Add write access to msDS-KeyCredentialLink for the target computer (Shadow Credentials attack)
 - Add Constrained Delegation to Computer
-- Add Resource-Based Contrained Delegation to Computer
+- Add Resource-Based Constrained Delegation to Computer
 
 ## Usage
 
