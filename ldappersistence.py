@@ -365,7 +365,7 @@ def log_success(text):
     print('[+] %s' % text)
 
 def main():
-    parser = argparse.ArgumentParser(description='Domain Persistence via LDAP. Executes sneaky Domain persistence techniques.', formatter_class=RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description='Domain Persistence via LDAP. Executes Domain persistence techniques.', formatter_class=RawTextHelpFormatter)
     parser._optionals.title = "Main options"
     parser._positionals.title = "Required options"
 
@@ -428,7 +428,7 @@ def main():
     dd = ADPersistence(s, c, cnf)
 
     #Do the actual attacks
-    dd.ADPersistenceAttacks(args.user,args.attack, args.target,args.host, args.password, args.spn, args.computer)
+    dd.ADPersistenceAttacks(args.attack, args.target, args.spn, args.computer)
     log_success('Attack finished')
 
 if __name__ == '__main__':
