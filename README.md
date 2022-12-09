@@ -1,5 +1,5 @@
 # LDAP Persistence
-Python tool to execute several AD persistence techniques through LDAP queries.
+Python tool to execute several Active Directory persistence techniques through LDAP queries.
 
 ## Features
 
