@@ -57,13 +57,13 @@ python3 ldappersistence.py <HOST> -a 5 -t targetComputer
 ### Add Constrained Delegation to Computer
 
 ```
-python3 ldappersistence.py <HOST> -a 6 -t targetComputer
+python3 ldappersistence.py <HOST> -a 6 -t targetComputer -spn cifs/test.example.local
 ```
 
 ### Add Resource-Based Constrained Delegation to Computer
 
 ```
-python3 ldappersistence.py <HOST> -a 7 -t targetComputer
+python3 ldappersistence.py <HOST> -a 7 -t targetComputer -computer example-pc
 ```
 
 ## References
